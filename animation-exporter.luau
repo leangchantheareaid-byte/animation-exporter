@@ -1,5 +1,5 @@
--- Animation-focused edition. Returns exportAnimations(config), not the original
--- saveinstance(options) entry point. See animation-exporter-README.md.
+-- Animation-focused edition. Calling the returned function opens a folder
+-- picker; SourceRoots in config runs a direct export. See the README.
 --!native
 --!optimize 2
 --!divine-intellect
@@ -4976,8 +4976,9 @@ local function synsaveinstance(...)
 				local allowed = false
 				if parent == nil then
 					allowed = instance:IsA("ReplicatedStorage")
-				elseif parent:IsA("ReplicatedStorage") then
-					allowed = instance:IsA("KeyframeSequence")
+				elseif parent:IsA("ReplicatedStorage") or parent:IsA("Folder") then
+					allowed = instance:IsA("Folder") or instance:IsA("Animation")
+						or instance:IsA("KeyframeSequence") or instance:IsA("ObjectValue")
 				elseif parent:IsA("KeyframeSequence") then
 					allowed = instance:IsA("Keyframe")
 				elseif parent:IsA("Keyframe") then
@@ -6754,8 +6755,7 @@ local function synsaveinstance(...)
 	return ok, err, placename
 end
 
--- Export only keyframe content visible in this client. Animation objects are
--- read as references and described in the JSON report, never serialized.
+-- Export only selected animation references and accessible keyframe content.
 local function makeAnimationStatus()
 	local gui
 	local label
@@ -6916,10 +6916,45 @@ local function exportAnimationsImpl(config, updateProgress, finishProgress)
 	local animations = {}
 	local existingSequences = {}
 	local byFingerprint = {}
-	local usedExportNames = {}
 	local duplicateSequences = 0
+	local sequenceCopies = 0
+	local linkedDuplicates = 0
+	local sequenceByRecord = {}
+	local linkDuplicates = config.LinkDuplicateMovements == true
 
-	local function addSequence(sequence, source)
+	local function placeDuplicate(record, source, folder, candidate)
+		if linkDuplicates then
+			local reference = Instance.new("ObjectValue")
+			reference.Name = source.name
+			reference.Value = sequenceByRecord[record]
+			reference.Parent = folder
+			source.savedAs = "ObjectValue link to matching KeyframeSequence"
+			linkedDuplicates += 1
+		else
+			local copy = candidate
+			if not copy then
+				local ok, result = pcall(function()
+					return sequenceByRecord[record]:Clone()
+				end)
+				if ok then
+					copy = result
+				end
+			end
+			if not copy then
+				source.savedAs = "clone_failed"
+				return false
+			end
+			copy.Name = source.name
+			copy.Parent = folder
+			source.savedAs = "KeyframeSequence copy"
+			sequenceCopies += 1
+		end
+		duplicateSequences += 1
+		record.sources[#record.sources + 1] = source
+		return true
+	end
+
+	local function addSequence(sequence, source, folder, isLive)
 		local ok, fingerprint = pcall(sequenceFingerprint, sequence)
 		local comparisonError
 		if not ok then
@@ -6930,22 +6965,25 @@ local function exportAnimationsImpl(config, updateProgress, finishProgress)
 		end
 		local match = fingerprint and byFingerprint[fingerprint]
 		if match then
-			match.sources[#match.sources + 1] = source
-			duplicateSequences += 1
-			return match, true
+			local candidate = not isLive and sequence.Parent == nil and sequence or nil
+			local placed = placeDuplicate(match, source, folder, candidate)
+			return match, true, placed
 		end
-		local baseName = sequence.Name ~= "" and sequence.Name or "Untitled animation"
-		local exportedName = sequence.Name
-		if sequence.Parent == nil then
-			exportedName = baseName
-			local suffix = 2
-			while usedExportNames[exportedName] do
-				exportedName = baseName .. " (" .. suffix .. ")"
-				suffix += 1
+		local material = sequence
+		if isLive or sequence.Parent ~= nil then
+			local cloned, result = pcall(function()
+				return sequence:Clone()
+			end)
+			material = cloned and result or nil
+			if not material then
+				source.savedAs = "clone_failed"
+				return nil, false, false
 			end
-			sequence.Name = exportedName
 		end
-		usedExportNames[exportedName] = true
+		material.Name = source.name
+		material.Parent = folder
+		source.savedAs = "KeyframeSequence"
+		sequenceCopies += 1
 		local keyframeCount = 0
 		for _, child in sequence:GetChildren() do
 			if child:IsA("Keyframe") then
@@ -6953,7 +6991,7 @@ local function exportAnimationsImpl(config, updateProgress, finishProgress)
 			end
 		end
 		local record = {
-			name = exportedName,
+			name = material.Name,
 			keyframes = keyframeCount,
 			sources = { source },
 		}
@@ -6963,9 +7001,9 @@ local function exportAnimationsImpl(config, updateProgress, finishProgress)
 		if fingerprint then
 			byFingerprint[fingerprint] = record
 		end
-		roots[#roots + 1] = sequence
+		sequenceByRecord[record] = material
 		report.sequences[#report.sequences + 1] = record
-		return record, false
+		return record, false, true
 	end
 
 	-- Only scan folders/models chosen in the picker. A child selected alongside
@@ -6998,6 +7036,54 @@ local function exportAnimationsImpl(config, updateProgress, finishProgress)
 	table.sort(selectedRoots, function(a, b)
 		return a:GetFullName() < b:GetFullName()
 	end)
+	local outputAncestors = {}
+	local branches = {}
+	local sourceOwner = {}
+	local function makeFolder(name, parent)
+		local folder = Instance.new("Folder")
+		folder.Name = name
+		if parent then
+			folder.Parent = parent
+		else
+			roots[#roots + 1] = folder
+		end
+		return folder
+	end
+	local function outputAncestor(source)
+		if source == storage then
+			return nil
+		end
+		if outputAncestors[source] then
+			return outputAncestors[source]
+		end
+		local folder = makeFolder(source.Name, outputAncestor(source.Parent))
+		outputAncestors[source] = folder
+		return folder
+	end
+	for _, sourceRoot in selectedRoots do
+		local parent = outputAncestor(sourceRoot.Parent)
+		branches[sourceRoot] = {
+			original = makeFolder(sourceRoot.Name, parent),
+			keyframes = makeFolder(sourceRoot.Name .. "_keyframes", parent),
+			originalFolders = {},
+			keyframeFolders = {},
+		}
+	end
+	local function outputFolderFor(sourceParent, sourceRoot, keyframes)
+		local branch = branches[sourceRoot]
+		local rootFolder = keyframes and branch.keyframes or branch.original
+		if sourceParent == sourceRoot then
+			return rootFolder
+		end
+		local cache = keyframes and branch.keyframeFolders or branch.originalFolders
+		if cache[sourceParent] then
+			return cache[sourceParent]
+		end
+		local parentFolder = outputFolderFor(sourceParent.Parent, sourceRoot, keyframes)
+		local folder = makeFolder(sourceParent.Name, parentFolder)
+		cache[sourceParent] = folder
+		return folder
+	end
 	local scanned = {}
 	for rootIndex, root in selectedRoots do
 		updateProgress("Scanning selected container " .. rootIndex .. "/" .. #selectedRoots
@@ -7008,8 +7094,14 @@ local function exportAnimationsImpl(config, updateProgress, finishProgress)
 				scanned[instance] = true
 				if instance:IsA("Animation") then
 					animations[#animations + 1] = instance
+					sourceOwner[instance] = root
+					local copy = Instance.new("Animation")
+					copy.Name = instance.Name
+					copy.AnimationId = instance.AnimationId
+					copy.Parent = outputFolderFor(instance.Parent, root, false)
 				elseif instance:IsA("KeyframeSequence") then
 					existingSequences[#existingSequences + 1] = instance
+					sourceOwner[instance] = root
 					local keyframeCount = 0
 					for _, child in instance:GetChildren() do
 						if child:IsA("Keyframe") then
@@ -7040,11 +7132,16 @@ local function exportAnimationsImpl(config, updateProgress, finishProgress)
 	updateProgress("Found " .. #animations .. " Animation objects and "
 		.. #report.existingSequences .. " existing KeyframeSequences")
 	for index, sequence in existingSequences do
-		addSequence(sequence, {
+		local source = {
 			type = "existing_sequence",
 			name = sequence.Name,
 			path = sequence:GetFullName(),
-		})
+		}
+		local folder = outputFolderFor(sequence.Parent, sourceOwner[sequence], true)
+		local record = addSequence(sequence, source, folder, true)
+		if not record then
+			report.existingSequences[index].status = "clone_failed"
+		end
 		if index % 50 == 0 then
 			updateProgress("Comparing existing sequences " .. index .. "/" .. #existingSequences,
 				nil, false)
@@ -7086,16 +7183,22 @@ local function exportAnimationsImpl(config, updateProgress, finishProgress)
 			item.status = "missing_id"
 		elseif seenId[id] then
 			item.status = seenId[id].status
-			item.exportedSequenceName = seenId[id].exportedSequenceName
 			item.detail = "Same ID as an earlier Animation; clip requested once."
 			local record = seenId[id].sequenceRecord
 			if record then
-				record.sources[#record.sources + 1] = {
+				local source = {
 					type = "animation",
 					name = item.name,
 					animationId = id,
 					path = item.path,
 				}
+				local folder = outputFolderFor(animation.Parent, sourceOwner[animation], true)
+				local placed = placeDuplicate(record, source, folder)
+				item.savedAs = source.savedAs
+				item.status = placed and "duplicate_keyframe_sequence" or "clone_failed"
+				if placed then
+					item.exportedSequenceName = linkDuplicates and record.name or item.name
+				end
 			end
 		elseif not provider then
 			item.status = "provider_unavailable"
@@ -7113,21 +7216,26 @@ local function exportAnimationsImpl(config, updateProgress, finishProgress)
 				item.status = "inaccessible_or_unsupported"
 				item.detail = tostring(clip)
 			elseif clip and clip:IsA("KeyframeSequence") then
-				clip.Name = animation.Name
 				updateProgress("Comparing keyframes " .. (processedIds + 1) .. "/" .. uniqueIdCount,
 					nil, false)
-				local record, duplicate = addSequence(clip, {
+				local source = {
 					type = "animation",
 					name = item.name,
 					animationId = id,
 					path = item.path,
-				})
-				item.status = duplicate and "duplicate_keyframe_sequence"
-					or "fetched_keyframe_sequence"
+				}
+				local folder = outputFolderFor(animation.Parent, sourceOwner[animation], true)
+				local record, duplicate, placed = addSequence(clip, source, folder, false)
+				item.status = placed and (duplicate and "duplicate_keyframe_sequence"
+					or "fetched_keyframe_sequence") or "clone_failed"
 				fetchedSequences += 1
-				item.exportedSequenceName = record.name
-				item.keyframes = record.keyframes
-				item.sequenceRecord = record
+				item.savedAs = source.savedAs
+				if record then
+					item.exportedSequenceName = duplicate and not linkDuplicates
+						and item.name or record.name
+					item.keyframes = record.keyframes
+					item.sequenceRecord = record
+				end
 			elseif clip and clip:IsA("CurveAnimation") then
 				item.status = "unsupported_curve_data"
 				item.detail = "Retrieved a CurveAnimation, which has no KeyframeSequence to export."
@@ -7154,8 +7262,11 @@ local function exportAnimationsImpl(config, updateProgress, finishProgress)
 		item.sequenceRecord = nil -- Report JSON stores only plain data.
 	end
 	report.fetchedKeyframeSequences = fetchedSequences
-	report.uniqueKeyframeSequences = #roots
+	report.uniqueKeyframeSequences = #report.sequences
+	report.savedKeyframeSequences = sequenceCopies
+	report.linkedDuplicates = linkedDuplicates
 	report.duplicateKeyframeSequences = duplicateSequences
+	report.duplicateMode = linkDuplicates and "links" or "copies"
 
 	if #roots == 0 then
 		report.status = "nothing_accessible"
@@ -7173,7 +7284,8 @@ local function exportAnimationsImpl(config, updateProgress, finishProgress)
 				IsModel = false,
 				FilePath = filePath,
 				Binary = true,
-				CompressionMode = false,
+				CompressionMode = "zstd",
+				CompressionLevel = 3,
 				ReadMe = false,
 				ShowStatus = true,
 				Decompile = false,
@@ -7205,9 +7317,9 @@ local function exportAnimationsImpl(config, updateProgress, finishProgress)
 		end
 	end
 	if report.status == "saved" then
-		finishProgress("SUCCESS: saved " .. filePath .. "; " .. #roots
-			.. " unique KeyframeSequences, " .. duplicateSequences
-			.. " duplicates skipped, " .. fetchedSequences .. " clips fetched", true)
+		finishProgress("SUCCESS: " .. filePath .. "; " .. sequenceCopies
+			.. " KeyframeSequences, " .. linkedDuplicates .. " links, "
+			.. duplicateSequences .. " matching movements", true)
 	else
 		finishProgress("FAILED: " .. report.status .. "; check " .. reportPath .. " and the console", false)
 		if report.error then
@@ -7281,7 +7393,7 @@ local function showAnimationPicker(config)
 		UDim2.fromOffset(30, 30), "X")
 	local hint = makeText("TextLabel", "Hint", panel, UDim2.new(0, 16, 0, 40),
 		UDim2.new(1, -32, 0, 44),
-		"Choose folders or models in ReplicatedStorage. Their Animation objects and existing keyframes will be included.")
+		"Choose folders or models in ReplicatedStorage. Copies keep a KeyframeSequence at every path; links make repeated clips smaller.")
 	hint.BackgroundTransparency = 1
 	hint.TextColor3 = colors.muted
 	hint.TextWrapped = true
@@ -7304,11 +7416,17 @@ local function showAnimationPicker(config)
 		UDim2.fromOffset(78, 34), "Clear")
 	clearButton.TextSize = 16
 	local resultInfo = makeText("TextLabel", "ResultInfo", panel, UDim2.new(0, 16, 0, 128),
-		UDim2.new(1, -32, 0, 23), "Loading ReplicatedStorage...")
+		UDim2.new(1, -232, 0, 23), "Loading ReplicatedStorage...")
 	resultInfo.BackgroundTransparency = 1
 	resultInfo.TextXAlignment = Enum.TextXAlignment.Left
 	resultInfo.TextColor3 = colors.muted
 	resultInfo.TextSize = 16
+	resultInfo.TextTruncate = Enum.TextTruncate.AtEnd
+	local linkDuplicates = config and config.LinkDuplicateMovements == true
+	local modeButton = makeText("TextButton", "DuplicateMode", panel,
+		UDim2.new(1, -216, 0, 127), UDim2.fromOffset(200, 24),
+		linkDuplicates and "Repeated clips: Link" or "Repeated clips: Copy")
+	modeButton.TextSize = 15
 
 	local list = Instance.new("ScrollingFrame")
 	list.Name = "Containers"
@@ -7552,6 +7670,14 @@ local function showAnimationPicker(config)
 	end
 	search:GetPropertyChangedSignal("Text"):Connect(render)
 	refreshButton.Activated:Connect(refresh)
+	modeButton.Activated:Connect(function()
+		if busy then
+			return
+		end
+		linkDuplicates = not linkDuplicates
+		modeButton.Text = linkDuplicates and "Repeated clips: Link"
+			or "Repeated clips: Copy"
+	end)
 	allButton.Activated:Connect(function()
 		for _, entry in roots do
 			if entry.animationCount > 0 or entry.sequenceCount > 0 then
@@ -7601,8 +7727,11 @@ local function showAnimationPicker(config)
 				or Color3.fromRGB(255, 125, 125))
 		end
 		task.spawn(function()
-			local ok, result = pcall(exportAnimationsImpl,
-				{ SourceRoots = chosen, FilePath = config and config.FilePath }, update, finish)
+			local ok, result = pcall(exportAnimationsImpl, {
+				SourceRoots = chosen,
+				FilePath = config and config.FilePath,
+				LinkDuplicateMovements = linkDuplicates,
+			}, update, finish)
 			if not ok then
 				finish("FAILED: " .. tostring(result), false)
 				warn("[Animation export] " .. tostring(result))
