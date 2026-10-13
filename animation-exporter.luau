@@ -4975,7 +4975,9 @@ local function synsaveinstance(...)
 			if OPTIONS.AnimationOnly then
 				local allowed = false
 				if parent == nil then
-					allowed = instance:IsA("Animation") or instance:IsA("KeyframeSequence")
+					allowed = instance:IsA("ReplicatedStorage")
+				elseif parent:IsA("ReplicatedStorage") then
+					allowed = instance:IsA("KeyframeSequence")
 				elseif parent:IsA("KeyframeSequence") then
 					allowed = instance:IsA("Keyframe")
 				elseif parent:IsA("Keyframe") then
@@ -5897,6 +5899,15 @@ local function synsaveinstance(...)
 			end)
 		end
 
+		-- A place file needs a service at its root. Override the local service's
+		-- child list for serialization, so only selected sequences appear under
+		-- ReplicatedStorage in the saved place. This does not reparent live objects.
+		if OPTIONS.AnimationOnly and not IsModel then
+			local animationRoot = service.ReplicatedStorage
+			InstancesOverrides[animationRoot] = { __Children = ToSaveList }
+			ToSaveList = { animationRoot }
+		end
+
 		-- One collect over the main roots plus every extra's roots.
 		local allRoots = table.clone(ToSaveList)
 		for _, extra in pendingExtras do
@@ -6743,8 +6754,8 @@ local function synsaveinstance(...)
 	return ok, err, placename
 end
 
--- Export only replicated Animation objects and KeyframeSequences visible in
--- this client. The regular serializer is kept above for .rbxm generation.
+-- Export only keyframe content visible in this client. Animation objects are
+-- read as references and described in the JSON report, never serialized.
 local function makeAnimationStatus()
 	local gui
 	local label
@@ -6820,73 +6831,227 @@ local function makeAnimationStatus()
 	return update, finish
 end
 
+-- Build an order-independent description of the data that affects a clip.
+-- Sequence names are omitted so differently named copies can share one
+-- exported sequence. Keyframe and pose names are retained because callers
+-- can refer to keyframe names and pose names identify animated joints.
+local function sequenceFingerprint(sequence)
+	local function number(value)
+		return string.format("%.17g", value)
+	end
+	local function encode(instance)
+		local kind = instance.ClassName
+		local fields = { kind }
+		local function add(value)
+			local str = tostring(value)
+			fields[#fields + 1] = #str .. ":" .. str
+		end
+		if kind == "KeyframeSequence" then
+			add(sequence.Loop)
+			add(sequence.Priority.Value)
+		elseif kind == "Keyframe" then
+			add(instance.Name)
+			add(number(instance.Time))
+		elseif kind == "Pose" then
+			add(instance.Name)
+			add(number(instance.Weight))
+			add(instance.EasingStyle.Value)
+			add(instance.EasingDirection.Value)
+			for _, component in { instance.CFrame:GetComponents() } do
+				add(number(component))
+			end
+		elseif kind == "NumberPose" then
+			add(instance.Name)
+			add(number(instance.Value))
+			add(number(instance.Weight))
+			add(instance.EasingStyle.Value)
+			add(instance.EasingDirection.Value)
+		elseif kind == "KeyframeMarker" then
+			add(instance.Name)
+			add(instance.Value)
+		end
+		local children = {}
+		for _, child in instance:GetChildren() do
+			local allowed = (kind == "KeyframeSequence" and child:IsA("Keyframe"))
+				or (kind == "Keyframe" and (child:IsA("Pose")
+					or child:IsA("NumberPose") or child:IsA("KeyframeMarker")))
+				or (kind == "Pose" and (child:IsA("Pose") or child:IsA("NumberPose")))
+			if allowed then
+				children[#children + 1] = encode(child)
+			end
+		end
+		table.sort(children)
+		for _, child in children do
+			add(child)
+		end
+		return table.concat(fields, "|")
+	end
+	return encode(sequence)
+end
+
 local function exportAnimationsImpl(config, updateProgress, finishProgress)
 	config = config or {}
 	local filePath = config.FilePath or "animations-place.rbxl"
 	local lowerPath = string.lower(filePath)
-	local isPlaceFile = string.sub(lowerPath, -5) ~= ".rbxm"
-	if string.sub(lowerPath, -5) ~= ".rbxl" and string.sub(lowerPath, -5) ~= ".rbxm" then
+	if string.sub(lowerPath, -5) == ".rbxm" then
+		filePath = string.sub(filePath, 1, -6) .. ".rbxl"
+	elseif string.sub(lowerPath, -5) ~= ".rbxl" then
 		filePath ..= ".rbxl"
 	end
 	local reportPath = string.sub(filePath, 1, -6) .. ".json"
 	local report = {
-		modelFile = filePath,
 		outputFile = filePath,
-		outputFormat = isPlaceFile and "place" or "model",
+		outputFormat = "place",
 		reportFile = reportPath,
 		placeId = game.PlaceId,
+		selectedContainers = {},
 		animations = {},
 		existingSequences = {},
+		sequences = {},
 		curveAnimations = {},
 		status = "not_started",
 	}
 	local roots = {}
 	local seenId = {}
 	local animations = {}
+	local existingSequences = {}
+	local byFingerprint = {}
+	local usedExportNames = {}
+	local duplicateSequences = 0
 
-	-- GetDescendants sees only instances replicated to this client. It does not
-	-- inspect nil instances or request server-only services.
-	updateProgress("Scanning visible objects... 0%")
-	task.wait()
-	local descendants = game:GetDescendants()
-	local lastScanLog = -10
-	for index, instance in descendants do
-		if instance:IsA("Animation") then
-			roots[#roots + 1] = instance
-			animations[#animations + 1] = instance
-		elseif instance:IsA("KeyframeSequence") then
-			roots[#roots + 1] = instance
-			local keyframeCount = 0
-			for _, child in instance:GetChildren() do
-				if child:IsA("Keyframe") then
-					keyframeCount += 1
+	local function addSequence(sequence, source)
+		local ok, fingerprint = pcall(sequenceFingerprint, sequence)
+		local comparisonError
+		if not ok then
+			-- If a readable property is unavailable, keep the clip rather than
+			-- risk merging it with a different animation.
+			comparisonError = tostring(fingerprint)
+			fingerprint = nil
+		end
+		local match = fingerprint and byFingerprint[fingerprint]
+		if match then
+			match.sources[#match.sources + 1] = source
+			duplicateSequences += 1
+			return match, true
+		end
+		local baseName = sequence.Name ~= "" and sequence.Name or "Untitled animation"
+		local exportedName = sequence.Name
+		if sequence.Parent == nil then
+			exportedName = baseName
+			local suffix = 2
+			while usedExportNames[exportedName] do
+				exportedName = baseName .. " (" .. suffix .. ")"
+				suffix += 1
+			end
+			sequence.Name = exportedName
+		end
+		usedExportNames[exportedName] = true
+		local keyframeCount = 0
+		for _, child in sequence:GetChildren() do
+			if child:IsA("Keyframe") then
+				keyframeCount += 1
+			end
+		end
+		local record = {
+			name = exportedName,
+			keyframes = keyframeCount,
+			sources = { source },
+		}
+		if not ok then
+			record.comparison = "unavailable; kept separately: " .. comparisonError
+		end
+		if fingerprint then
+			byFingerprint[fingerprint] = record
+		end
+		roots[#roots + 1] = sequence
+		report.sequences[#report.sequences + 1] = record
+		return record, false
+	end
+
+	-- Only scan folders/models chosen in the picker. A child selected alongside
+	-- its parent is covered by the parent's scan and is not visited twice.
+	local storage = game:GetService("ReplicatedStorage")
+	local requested = config.SourceRoots or {}
+	local selectedSet = {}
+	for _, root in requested do
+		if typeof(root) == "Instance" and (root:IsA("Folder") or root:IsA("Model"))
+			and root:IsDescendantOf(storage) then
+			selectedSet[root] = true
+		end
+	end
+	local selectedRoots = {}
+	for root in selectedSet do
+		local ancestor = root.Parent
+		local covered = false
+		while ancestor and ancestor ~= storage do
+			if selectedSet[ancestor] then
+				covered = true
+				break
+			end
+			ancestor = ancestor.Parent
+		end
+		if not covered then
+			selectedRoots[#selectedRoots + 1] = root
+			report.selectedContainers[#report.selectedContainers + 1] = root:GetFullName()
+		end
+	end
+	table.sort(selectedRoots, function(a, b)
+		return a:GetFullName() < b:GetFullName()
+	end)
+	local scanned = {}
+	for rootIndex, root in selectedRoots do
+		updateProgress("Scanning selected container " .. rootIndex .. "/" .. #selectedRoots
+			.. ": " .. root.Name)
+		local descendants = root:GetDescendants()
+		for index, instance in descendants do
+			if not scanned[instance] then
+				scanned[instance] = true
+				if instance:IsA("Animation") then
+					animations[#animations + 1] = instance
+				elseif instance:IsA("KeyframeSequence") then
+					existingSequences[#existingSequences + 1] = instance
+					local keyframeCount = 0
+					for _, child in instance:GetChildren() do
+						if child:IsA("Keyframe") then
+							keyframeCount += 1
+						end
+					end
+					report.existingSequences[#report.existingSequences + 1] = {
+						name = instance.Name,
+						path = instance:GetFullName(),
+						keyframes = keyframeCount,
+					}
+				elseif instance:IsA("CurveAnimation") then
+					report.curveAnimations[#report.curveAnimations + 1] = {
+						name = instance.Name,
+						path = instance:GetFullName(),
+						status = "unsupported_curve_data",
+					}
 				end
 			end
-			report.existingSequences[#report.existingSequences + 1] = {
-				name = instance.Name,
-				path = instance:GetFullName(),
-				keyframes = keyframeCount,
-			}
-		elseif instance:IsA("CurveAnimation") then
-			report.curveAnimations[#report.curveAnimations + 1] = {
-				name = instance.Name,
-				path = instance:GetFullName(),
-				status = "unsupported_curve_data",
-			}
-		end
-		if index % 1000 == 0 then
-			local percent = math.floor(index / #descendants * 100)
-			local shouldLog = percent >= lastScanLog + 10
-			if shouldLog then
-				lastScanLog = percent
+			if index % 1000 == 0 then
+				updateProgress("Scanning " .. root.Name .. "... "
+					.. math.floor(index / #descendants * 100) .. "%", nil, false)
+				task.wait()
 			end
-			updateProgress("Scanning visible objects... " .. percent .. "%", nil, shouldLog)
+		end
+	end
+	scanned = nil
+	updateProgress("Found " .. #animations .. " Animation objects and "
+		.. #report.existingSequences .. " existing KeyframeSequences")
+	for index, sequence in existingSequences do
+		addSequence(sequence, {
+			type = "existing_sequence",
+			name = sequence.Name,
+			path = sequence:GetFullName(),
+		})
+		if index % 50 == 0 then
+			updateProgress("Comparing existing sequences " .. index .. "/" .. #existingSequences,
+				nil, false)
 			task.wait()
 		end
 	end
-	descendants = nil
-	updateProgress("Found " .. #animations .. " Animation objects and "
-		.. #report.existingSequences .. " existing KeyframeSequences")
+	existingSequences = nil
 
 	local uniqueIds = {}
 	local uniqueIdCount = 0
@@ -6914,14 +7079,24 @@ local function exportAnimationsImpl(config, updateProgress, finishProgress)
 			name = animation.Name,
 			animationId = id,
 			path = animation:GetFullName(),
-			status = "id_only",
+			status = "not_fetched",
 		}
 		report.animations[#report.animations + 1] = item
 		if id == "" then
 			item.status = "missing_id"
 		elseif seenId[id] then
 			item.status = seenId[id].status
-			item.detail = "Same ID as an earlier Animation; clip fetched once."
+			item.exportedSequenceName = seenId[id].exportedSequenceName
+			item.detail = "Same ID as an earlier Animation; clip requested once."
+			local record = seenId[id].sequenceRecord
+			if record then
+				record.sources[#record.sources + 1] = {
+					type = "animation",
+					name = item.name,
+					animationId = id,
+					path = item.path,
+				}
+			end
 		elseif not provider then
 			item.status = "provider_unavailable"
 			item.detail = tostring(providerResult)
@@ -6938,21 +7113,21 @@ local function exportAnimationsImpl(config, updateProgress, finishProgress)
 				item.status = "inaccessible_or_unsupported"
 				item.detail = tostring(clip)
 			elseif clip and clip:IsA("KeyframeSequence") then
-				local assetNumber = string.match(id, "rbxassetid://(%d+)")
-					or string.match(id, "[?&]id=(%d+)")
-					or string.match(id, "^(%d+)$")
-				clip.Name = animation.Name .. (assetNumber and (" [" .. assetNumber .. "]") or "")
-				roots[#roots + 1] = clip
-				item.status = "fetched_keyframe_sequence"
+				clip.Name = animation.Name
+				updateProgress("Comparing keyframes " .. (processedIds + 1) .. "/" .. uniqueIdCount,
+					nil, false)
+				local record, duplicate = addSequence(clip, {
+					type = "animation",
+					name = item.name,
+					animationId = id,
+					path = item.path,
+				})
+				item.status = duplicate and "duplicate_keyframe_sequence"
+					or "fetched_keyframe_sequence"
 				fetchedSequences += 1
-				item.exportedSequenceName = clip.Name
-				local keyframeCount = 0
-				for _, child in clip:GetChildren() do
-					if child:IsA("Keyframe") then
-						keyframeCount += 1
-					end
-				end
-				item.keyframes = keyframeCount
+				item.exportedSequenceName = record.name
+				item.keyframes = record.keyframes
+				item.sequenceRecord = record
 			elseif clip and clip:IsA("CurveAnimation") then
 				item.status = "unsupported_curve_data"
 				item.detail = "Retrieved a CurveAnimation, which has no KeyframeSequence to export."
@@ -6975,14 +7150,19 @@ local function exportAnimationsImpl(config, updateProgress, finishProgress)
 				nil, shouldLog)
 		end
 	end
+	for _, item in report.animations do
+		item.sequenceRecord = nil -- Report JSON stores only plain data.
+	end
 	report.fetchedKeyframeSequences = fetchedSequences
+	report.uniqueKeyframeSequences = #roots
+	report.duplicateKeyframeSequences = duplicateSequences
 
 	if #roots == 0 then
 		report.status = "nothing_accessible"
 	else
 		if not writefile and not config.Callback then
 			report.status = "no_file_writer"
-			report.error = "writefile is unavailable; provide a Callback to receive .rbxm bytes."
+			report.error = "writefile is unavailable; provide a Callback to receive .rbxl bytes."
 		else
 			updateProgress("Building " .. filePath .. "; file size and writing progress appear at the top right")
 			task.wait()
@@ -6990,7 +7170,7 @@ local function exportAnimationsImpl(config, updateProgress, finishProgress)
 				mode = "animation-only",
 				AnimationOnly = true,
 				ExtraInstances = roots,
-				IsModel = not isPlaceFile,
+				IsModel = false,
 				FilePath = filePath,
 				Binary = true,
 				CompressionMode = false,
@@ -7025,9 +7205,9 @@ local function exportAnimationsImpl(config, updateProgress, finishProgress)
 		end
 	end
 	if report.status == "saved" then
-		finishProgress("SUCCESS: saved " .. filePath .. "; " .. #report.animations
-			.. " Animation objects, " .. #report.existingSequences
-			.. " existing sequences, " .. fetchedSequences .. " fetched keyframe clips", true)
+		finishProgress("SUCCESS: saved " .. filePath .. "; " .. #roots
+			.. " unique KeyframeSequences, " .. duplicateSequences
+			.. " duplicates skipped, " .. fetchedSequences .. " clips fetched", true)
 	else
 		finishProgress("FAILED: " .. report.status .. "; check " .. reportPath .. " and the console", false)
 		if report.error then
@@ -7048,4 +7228,399 @@ local function exportAnimations(config)
 	return { status = "failed", error = tostring(result) }
 end
 
-return exportAnimations
+local function showAnimationPicker(config)
+	local storage = game:GetService("ReplicatedStorage")
+	local gui = Instance.new("ScreenGui")
+	gui.Name = "AnimationSequencePicker"
+	gui.DisplayOrder = 2e9
+	gui.ResetOnSpawn = false
+	gui.IgnoreGuiInset = true
+
+	local colors = {
+		background = Color3.fromRGB(20, 24, 31),
+		row = Color3.fromRGB(36, 43, 54),
+		selected = Color3.fromRGB(34, 91, 69),
+		button = Color3.fromRGB(52, 62, 77),
+		accent = Color3.fromRGB(55, 147, 107),
+		text = Color3.fromRGB(238, 244, 247),
+		muted = Color3.fromRGB(175, 186, 196),
+	}
+	local function makeText(className, name, parent, position, size, caption)
+		local object = Instance.new(className)
+		object.Name = name
+		object.Position = position
+		object.Size = size
+		object.BackgroundColor3 = colors.button
+		object.BorderSizePixel = 0
+		object.Font = Enum.Font.SourceSans
+		object.TextSize = 18
+		object.TextColor3 = colors.text
+		object.Text = caption
+		object.Parent = parent
+		return object
+	end
+	local panel = Instance.new("Frame")
+	panel.Name = "Panel"
+	panel.AnchorPoint = Vector2.new(0.5, 0.5)
+	panel.Position = UDim2.fromScale(0.5, 0.5)
+	panel.Size = UDim2.fromScale(0.82, 0.8)
+	panel.BackgroundColor3 = colors.background
+	panel.BorderSizePixel = 0
+	panel.Parent = gui
+	local sizeLimit = Instance.new("UISizeConstraint")
+	sizeLimit.MaxSize = Vector2.new(820, 600)
+	sizeLimit.MinSize = Vector2.new(300, 330)
+	sizeLimit.Parent = panel
+
+	local title = makeText("TextLabel", "Title", panel, UDim2.new(0, 16, 0, 8),
+		UDim2.new(1, -64, 0, 30), "Animation exporter")
+	title.BackgroundTransparency = 1
+	title.TextXAlignment = Enum.TextXAlignment.Left
+	title.TextSize = 24
+	local closeButton = makeText("TextButton", "Close", panel, UDim2.new(1, -44, 0, 9),
+		UDim2.fromOffset(30, 30), "X")
+	local hint = makeText("TextLabel", "Hint", panel, UDim2.new(0, 16, 0, 40),
+		UDim2.new(1, -32, 0, 44),
+		"Choose folders or models in ReplicatedStorage. Their Animation objects and existing keyframes will be included.")
+	hint.BackgroundTransparency = 1
+	hint.TextColor3 = colors.muted
+	hint.TextWrapped = true
+	hint.TextXAlignment = Enum.TextXAlignment.Left
+	hint.TextSize = 16
+
+	local search = makeText("TextBox", "Search", panel, UDim2.new(0, 16, 0, 90),
+		UDim2.new(1, -270, 0, 34), "")
+	search.PlaceholderText = "Search folders or models..."
+	search.ClearTextOnFocus = false
+	search.TextXAlignment = Enum.TextXAlignment.Left
+	search.TextSize = 16
+	local refreshButton = makeText("TextButton", "Refresh", panel, UDim2.new(1, -246, 0, 90),
+		UDim2.fromOffset(72, 34), "Refresh")
+	refreshButton.TextSize = 16
+	local allButton = makeText("TextButton", "AllTopLevel", panel, UDim2.new(1, -170, 0, 90),
+		UDim2.fromOffset(72, 34), "All")
+	allButton.TextSize = 16
+	local clearButton = makeText("TextButton", "Clear", panel, UDim2.new(1, -94, 0, 90),
+		UDim2.fromOffset(78, 34), "Clear")
+	clearButton.TextSize = 16
+	local resultInfo = makeText("TextLabel", "ResultInfo", panel, UDim2.new(0, 16, 0, 128),
+		UDim2.new(1, -32, 0, 23), "Loading ReplicatedStorage...")
+	resultInfo.BackgroundTransparency = 1
+	resultInfo.TextXAlignment = Enum.TextXAlignment.Left
+	resultInfo.TextColor3 = colors.muted
+	resultInfo.TextSize = 16
+
+	local list = Instance.new("ScrollingFrame")
+	list.Name = "Containers"
+	list.Position = UDim2.new(0, 16, 0, 153)
+	list.Size = UDim2.new(1, -32, 1, -245)
+	list.BackgroundColor3 = Color3.fromRGB(27, 33, 42)
+	list.BorderSizePixel = 0
+	list.ScrollBarThickness = 6
+	list.AutomaticCanvasSize = Enum.AutomaticSize.Y
+	list.CanvasSize = UDim2.fromOffset(0, 0)
+	list.Parent = panel
+	local layout = Instance.new("UIListLayout")
+	layout.Padding = UDim.new(0, 3)
+	layout.Parent = list
+
+	local selectedInfo = makeText("TextLabel", "SelectedInfo", panel, UDim2.new(0, 16, 1, -88),
+		UDim2.new(1, -32, 0, 22), "0 selected")
+	selectedInfo.BackgroundTransparency = 1
+	selectedInfo.TextXAlignment = Enum.TextXAlignment.Left
+	selectedInfo.TextColor3 = colors.muted
+	selectedInfo.TextSize = 16
+	local exportButton = makeText("TextButton", "Export", panel, UDim2.new(0, 16, 1, -62),
+		UDim2.fromOffset(210, 42), "Export selected to .rbxl")
+	exportButton.BackgroundColor3 = colors.accent
+	exportButton.TextSize = 17
+	local status = makeText("TextLabel", "Status", panel, UDim2.new(0, 236, 1, -62),
+		UDim2.new(1, -252, 0, 42), "Ready")
+	status.BackgroundTransparency = 1
+	status.TextXAlignment = Enum.TextXAlignment.Left
+	status.TextWrapped = true
+	status.TextSize = 15
+
+	local parents = {}
+	if global_container.gethui then
+		local ok, parent = pcall(global_container.gethui)
+		if ok and parent then
+			parents[#parents + 1] = parent
+		end
+	end
+	parents[#parents + 1] = game:GetService("CoreGui")
+	local player = game:GetService("Players").LocalPlayer
+	if player then
+		parents[#parents + 1] = player:FindFirstChildOfClass("PlayerGui")
+	end
+	for _, parent in parents do
+		local ok = pcall(function()
+			local old = parent:FindFirstChild(gui.Name)
+			if old then
+				old:Destroy()
+			end
+			gui.Parent = parent
+		end)
+		if ok and gui.Parent then
+			break
+		end
+	end
+	if not gui.Parent then
+		gui:Destroy()
+		warn("[Animation export] Could not display the picker.")
+		return nil
+	end
+
+	local selected = {}
+	local expanded = {}
+	local roots = {}
+	local entries = {}
+	local busy = false
+	local refreshing = false
+	local function selectedCount()
+		local count = 0
+		for instance in selected do
+			if instance.Parent and instance:IsDescendantOf(storage) then
+				count += 1
+			end
+		end
+		return count
+	end
+	local function render()
+		for _, child in list:GetChildren() do
+			if child:IsA("Frame") then
+				child:Destroy()
+			end
+		end
+		local query = string.lower(search.Text)
+		local visible = {}
+		local function addTree(entry, depth)
+			visible[#visible + 1] = { entry = entry, depth = depth }
+			if expanded[entry.instance] then
+				for _, child in entry.children do
+					addTree(child, depth + 1)
+				end
+			end
+		end
+		if query == "" then
+			for _, entry in roots do
+				addTree(entry, 0)
+			end
+		else
+			for _, entry in entries do
+				if string.find(string.lower(entry.path), query, 1, true) then
+					visible[#visible + 1] = { entry = entry, depth = 0 }
+				end
+			end
+		end
+		local limit = math.min(#visible, 200)
+		for index = 1, limit do
+			local entry = visible[index].entry
+			local depth = visible[index].depth
+			local row = Instance.new("Frame")
+			row.Name = "Row" .. index
+			row.Size = UDim2.new(1, -8, 0, 32)
+			row.LayoutOrder = index
+			row.BackgroundColor3 = selected[entry.instance] and colors.selected or colors.row
+			row.BorderSizePixel = 0
+			row.Parent = list
+			local indent = math.min(depth * 18, 144)
+			local expand = makeText("TextButton", "Expand", row,
+				UDim2.fromOffset(4 + indent, 3), UDim2.fromOffset(24, 26),
+				#entry.children > 0 and (expanded[entry.instance] and "v" or ">") or " ")
+			expand.BackgroundTransparency = 1
+			expand.TextSize = 16
+			if #entry.children > 0 then
+				expand.Activated:Connect(function()
+					expanded[entry.instance] = not expanded[entry.instance]
+					render()
+				end)
+			end
+			local label = query == "" and entry.instance.Name or entry.path
+			local textButton = makeText("TextButton", "Select", row,
+				UDim2.new(0, 30 + indent, 0, 3), UDim2.new(1, -34 - indent, 0, 26),
+				(selected[entry.instance] and "[x] " or "[ ] ") .. label
+					.. "  (" .. entry.animationCount .. " anim, "
+					.. entry.sequenceCount .. " seq)")
+			textButton.BackgroundTransparency = 1
+			textButton.TextXAlignment = Enum.TextXAlignment.Left
+			textButton.TextTruncate = Enum.TextTruncate.AtEnd
+			textButton.TextSize = 16
+			textButton.Activated:Connect(function()
+				selected[entry.instance] = not selected[entry.instance] or nil
+				selectedInfo.Text = selectedCount() .. " selected"
+				render()
+			end)
+		end
+		resultInfo.Text = #entries .. " folders/models found; showing " .. limit
+			.. " of " .. #visible .. (limit < #visible and " (search to narrow)" or "")
+		selectedInfo.Text = selectedCount() .. " selected"
+	end
+	local function refresh()
+		if busy or refreshing then
+			return
+		end
+		refreshing = true
+		resultInfo.Text = "Loading ReplicatedStorage..."
+		task.spawn(function()
+			local ok, err = pcall(function()
+				local newRoots = {}
+				local newEntries = {}
+				local entryByInstance = {}
+				local descendants = storage:GetDescendants()
+				for index, instance in descendants do
+					if instance:IsA("Folder") or instance:IsA("Model") then
+						local entry = {
+							instance = instance,
+							children = {},
+							animationCount = 0,
+							sequenceCount = 0,
+						}
+						entryByInstance[instance] = entry
+						newEntries[#newEntries + 1] = entry
+					end
+					if index % 1500 == 0 then
+						resultInfo.Text = "Loading... " .. index .. "/" .. #descendants
+						task.wait()
+					end
+				end
+				local function parentEntryFor(instance)
+					local ancestor = instance.Parent
+					while ancestor and ancestor ~= storage do
+						local entry = entryByInstance[ancestor]
+						if entry then
+							return entry
+						end
+						ancestor = ancestor.Parent
+					end
+					return nil
+				end
+				local function pathFor(entry)
+					if entry.path then
+						return entry.path
+					end
+					local parentEntry = parentEntryFor(entry.instance)
+					entry.path = parentEntry and (pathFor(parentEntry) .. "/" .. entry.instance.Name)
+						or entry.instance.Name
+					return entry.path
+				end
+				for _, entry in newEntries do
+					local parentEntry = parentEntryFor(entry.instance)
+					local siblings = parentEntry and parentEntry.children or newRoots
+					siblings[#siblings + 1] = entry
+					pathFor(entry)
+				end
+				for index, instance in descendants do
+					if instance:IsA("Animation") or instance:IsA("KeyframeSequence") then
+						local ancestor = instance.Parent
+						while ancestor and ancestor ~= storage do
+							local entry = entryByInstance[ancestor]
+							if entry then
+								if instance:IsA("Animation") then
+									entry.animationCount += 1
+								else
+									entry.sequenceCount += 1
+								end
+							end
+							ancestor = ancestor.Parent
+						end
+					end
+					if index % 1500 == 0 then
+						resultInfo.Text = "Counting animations... " .. index .. "/" .. #descendants
+						task.wait()
+					end
+				end
+				local function sortEntries(items)
+					table.sort(items, function(a, b)
+						return string.lower(a.instance.Name) < string.lower(b.instance.Name)
+					end)
+					for _, item in items do
+						sortEntries(item.children)
+					end
+				end
+				sortEntries(newRoots)
+				roots = newRoots
+				entries = newEntries
+				render()
+			end)
+			refreshing = false
+			if not ok then
+				resultInfo.Text = "Could not read ReplicatedStorage."
+				warn("[Animation export] Picker refresh failed: " .. tostring(err))
+			end
+		end)
+	end
+	search:GetPropertyChangedSignal("Text"):Connect(render)
+	refreshButton.Activated:Connect(refresh)
+	allButton.Activated:Connect(function()
+		for _, entry in roots do
+			if entry.animationCount > 0 or entry.sequenceCount > 0 then
+				selected[entry.instance] = true
+			end
+		end
+		render()
+	end)
+	clearButton.Activated:Connect(function()
+		table.clear(selected)
+		render()
+	end)
+	closeButton.Activated:Connect(function()
+		if busy then
+			status.Text = "Export is still running. Please wait for the result."
+		else
+			gui:Destroy()
+		end
+	end)
+	exportButton.Activated:Connect(function()
+		if busy or refreshing then
+			return
+		end
+		local chosen = {}
+		for instance in selected do
+			if instance.Parent and instance:IsDescendantOf(storage) then
+				chosen[#chosen + 1] = instance
+			end
+		end
+		if #chosen == 0 then
+			status.Text = "Select at least one folder or model first."
+			return
+		end
+		busy = true
+		exportButton.Text = "Exporting..."
+		local function update(message, color, log)
+			if gui.Parent then
+				status.Text = message
+				status.TextColor3 = color or colors.text
+			end
+			if log ~= false then
+				print("[Animation export] " .. message)
+			end
+		end
+		local function finish(message, success)
+			update(message, success and Color3.fromRGB(105, 255, 145)
+				or Color3.fromRGB(255, 125, 125))
+		end
+		task.spawn(function()
+			local ok, result = pcall(exportAnimationsImpl,
+				{ SourceRoots = chosen, FilePath = config and config.FilePath }, update, finish)
+			if not ok then
+				finish("FAILED: " .. tostring(result), false)
+				warn("[Animation export] " .. tostring(result))
+			end
+			busy = false
+			if gui.Parent then
+				exportButton.Text = "Export selected to .rbxl"
+			end
+		end)
+	end)
+	refresh()
+	return gui
+end
+
+-- With no options, show the picker. Call with SourceRoots for a direct export.
+return function(config)
+	if config and config.SourceRoots then
+		return exportAnimations(config)
+	end
+	return showAnimationPicker(config)
+end
