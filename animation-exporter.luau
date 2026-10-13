@@ -6822,13 +6822,17 @@ end
 
 local function exportAnimationsImpl(config, updateProgress, finishProgress)
 	config = config or {}
-	local filePath = config.FilePath or "animations.rbxm"
-	if string.sub(string.lower(filePath), -5) ~= ".rbxm" then
-		filePath ..= ".rbxm"
+	local filePath = config.FilePath or "animations-place.rbxl"
+	local lowerPath = string.lower(filePath)
+	local isPlaceFile = string.sub(lowerPath, -5) ~= ".rbxm"
+	if string.sub(lowerPath, -5) ~= ".rbxl" and string.sub(lowerPath, -5) ~= ".rbxm" then
+		filePath ..= ".rbxl"
 	end
 	local reportPath = string.sub(filePath, 1, -6) .. ".json"
 	local report = {
 		modelFile = filePath,
+		outputFile = filePath,
+		outputFormat = isPlaceFile and "place" or "model",
 		reportFile = reportPath,
 		placeId = game.PlaceId,
 		animations = {},
@@ -6986,7 +6990,7 @@ local function exportAnimationsImpl(config, updateProgress, finishProgress)
 				mode = "animation-only",
 				AnimationOnly = true,
 				ExtraInstances = roots,
-				IsModel = true,
+				IsModel = not isPlaceFile,
 				FilePath = filePath,
 				Binary = true,
 				CompressionMode = false,
