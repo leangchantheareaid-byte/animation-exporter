@@ -6891,7 +6891,28 @@ end
 
 local function exportAnimationsImpl(config, updateProgress, finishProgress)
 	config = config or {}
-	local filePath = config.FilePath or "animations-place.rbxl"
+	local placeName
+	if not config.FilePath then
+		updateProgress("Reading game name for output file...")
+		local ok, info = pcall(function()
+			return game:GetService("MarketplaceService"):GetProductInfoAsync(game.PlaceId)
+		end)
+		if ok and info and type(info.Name) == "string" then
+			placeName = info.Name
+		end
+		if not placeName or placeName == "" then
+			placeName = game.Name
+		end
+	end
+	local safeName = placeName and string.sub(
+		string.gsub(string.gsub(placeName, "[^%w _%-]", ""), "%s+", "-"), 1, 80)
+	if safeName then
+		safeName = string.gsub(string.gsub(safeName, "^%-+", ""), "%-+$", "")
+	end
+	if not safeName or safeName == "" or safeName == "Game" then
+		safeName = "place-" .. tostring(game.PlaceId)
+	end
+	local filePath = config.FilePath or (safeName .. "-animations.rbxl")
 	local lowerPath = string.lower(filePath)
 	if string.sub(lowerPath, -5) == ".rbxm" then
 		filePath = string.sub(filePath, 1, -6) .. ".rbxl"
@@ -6904,6 +6925,7 @@ local function exportAnimationsImpl(config, updateProgress, finishProgress)
 		outputFormat = "place",
 		reportFile = reportPath,
 		placeId = game.PlaceId,
+		placeName = placeName,
 		selectedContainers = {},
 		animations = {},
 		existingSequences = {},
